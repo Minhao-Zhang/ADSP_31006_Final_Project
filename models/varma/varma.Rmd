@@ -5,13 +5,15 @@ library(MTS)
 library(tseries)
 library(ggplot2)
 library(patchwork)
+library(knitr)
 
 select <- dplyr::select
 ```
+
 ```{r}
 INPUT_FILE <- "../../data/processed/merged_features_weekly.parquet"
-FREQ       <- 52
-ALPHA      <- 0.05
+FREQ <- 52
+ALPHA <- 0.05
 
 VAR_VARS <- c(
   "target_price",
@@ -25,236 +27,459 @@ VAR_VARS <- c(
   "sppi_road_freight"
 )
 
-EXOG_VARS <- c("shock_2021q4_2023q1", "post_shock")
+EXOG_VARS <- c(
+  "shock_2021q4_2023q1",
+  "post_shock"
+)
 
-ORDERS_TO_TRY <- list(c(1, 0), c(1, 1), c(2, 1), c(1, 2))
+ORDERS_TO_TRY <- list(
+  c(1,0),
+  c(1,1),
+  c(2,1),
+  c(1,2)
+)
 
 calc_smape <- function(actual, pred) {
-  mean(200 * abs(actual - pred) / (abs(actual) + abs(pred)), na.rm = TRUE)
+  mean(200 * abs(actual - pred) /
+         (abs(actual) + abs(pred)),
+       na.rm = TRUE)
 }
 
 make_stationary <- function(x, name, alpha = 0.05) {
+
   s <- x
+
   for (d in 0:2) {
-    pval <- tryCatch(adf.test(s[!is.na(s)])$p.value, error = function(e) 1)
-    if (pval < alpha) return(list(series = s, d = d))
+
+    pval <- tryCatch(
+      adf.test(s[!is.na(s)])$p.value,
+      error = function(e) 1
+    )
+
+    if (pval < alpha)
+      return(list(series = s, d = d))
+
     s <- c(NA, diff(s))
   }
+
   list(series = s, d = 2)
 }
 
 extract_aic_bic <- function(model_obj, n_obs, k, p, q) {
+
   sig <- model_obj$Sigma
-  if (is.null(sig) || any(is.na(sig))) return(list(aic = NA, bic = NA))
-  ll       <- -(n_obs / 2) * log(det(sig))
+
+  if (is.null(sig) || any(is.na(sig)))
+    return(list(aic = NA, bic = NA))
+
+  ll <- -(n_obs/2) * log(det(sig))
+
   n_params <- k^2 * (p + q) + k
-  list(aic = -2 * ll + 2 * n_params,
-       bic = -2 * ll + log(n_obs) * n_params)
+
+  list(
+    aic = -2*ll + 2*n_params,
+    bic = -2*ll + log(n_obs)*n_params
+  )
 }
 ```
+
 ```{r}
 df <- arrow::read_parquet(INPUT_FILE) %>%
   mutate(date = as.Date(date)) %>%
   arrange(date)
 
-if (!"target_was_missing" %in% names(df)) df$target_was_missing <- 0L
+if (!"target_was_missing" %in% names(df))
+  df$target_was_missing <- 0L
 
 commodities <- unique(df$commodity)
 ```
+
 ```{r}
 all_results <- list()
-best_models <- list()
+all_models  <- list()
 all_preds   <- list()
 
 for (comm in commodities) {
-  sub <- df %>% filter(commodity == comm) %>% arrange(date)
+
+  sub <- df %>%
+    filter(commodity == comm) %>%
+    arrange(date)
+
   if (!"split" %in% names(sub)) next
 
-  train_df <- sub %>% filter(split == "train")
-  test_df  <- sub %>% filter(split == "test")
+  train_df <- sub %>%
+    filter(split == "train")
+
+  test_df <- sub %>%
+    filter(split == "test")
 
   if (nrow(train_df) < 50 || nrow(test_df) == 0) next
 
   n_test   <- nrow(test_df)
   real_idx <- test_df$target_was_missing == 0
 
-  avail_vars <- VAR_VARS[VAR_VARS %in% names(sub) &
-                           sapply(VAR_VARS, function(v) sum(!is.na(train_df[[v]])) > 20)]
+  avail_vars <- VAR_VARS[
+    VAR_VARS %in% names(sub) &
+      sapply(VAR_VARS,
+             function(v)
+               sum(!is.na(train_df[[v]])) > 20)
+  ]
+
   if (!"target_price" %in% avail_vars) next
-  avail_vars <- c("target_price", avail_vars[avail_vars != "target_price"])
-  k          <- length(avail_vars)
+
+  avail_vars <- c(
+    "target_price",
+    avail_vars[avail_vars != "target_price"]
+  )
+
+  k <- length(avail_vars)
 
   train_mat <- train_df %>%
-    dplyr::select(all_of(avail_vars)) %>%
-    mutate(across(everything(), ~ ifelse(is.na(.), mean(., na.rm = TRUE), .)))
+    select(all_of(avail_vars)) %>%
+    mutate(across(
+      everything(),
+      ~ ifelse(is.na(.), mean(., na.rm = TRUE), .)
+    ))
 
-  d_orders   <- setNames(integer(k), avail_vars)
+  d_orders <- setNames(integer(k), avail_vars)
+
   train_stat <- train_mat
 
   for (v in avail_vars) {
-    res             <- make_stationary(train_mat[[v]], v, ALPHA)
+
+    res <- make_stationary(train_mat[[v]], v, ALPHA)
+
     train_stat[[v]] <- res$series
-    d_orders[v]     <- res$d
+    d_orders[v] <- res$d
   }
 
-  train_stat <- train_stat %>% drop_na()
+  train_stat <- train_stat %>%
+    drop_na()
+
   if (nrow(train_stat) < 50) next
 
   order_results <- list()
+
   for (ord in ORDERS_TO_TRY) {
-    p <- ord[1]; q <- ord[2]
-    min_rows <- k * (p + q + 10)
+
+    p <- ord[1]
+    q <- ord[2]
+
+    min_rows <- k*(p+q+10)
+
     if (nrow(train_stat) < min_rows) next
 
     m <- tryCatch(
-      suppressMessages(suppressWarnings(
-        VARMA(as.matrix(train_stat), p = p, q = q, include.mean = TRUE)
-      )),
+      suppressMessages(
+        suppressWarnings(
+          VARMA(
+            as.matrix(train_stat),
+            p = p,
+            q = q,
+            include.mean = TRUE
+          )
+        )
+      ),
       error = function(e) NULL
     )
+
     if (is.null(m)) next
 
-    info <- extract_aic_bic(m, nrow(train_stat), k, p, q)
-    label_ord <- paste0("VARMA(", p, ",", q, ")")
-    order_results[[label_ord]] <- list(model = m, p = p, q = q, aic = info$aic, bic = info$bic)
+    info <- extract_aic_bic(
+      m,
+      nrow(train_stat),
+      k,
+      p,
+      q
+    )
+
+    label_ord <- paste0("VARMA(",p,",",q,")")
+
+    order_results[[label_ord]] <- list(
+      model = m,
+      p = p,
+      q = q,
+      aic = info$aic,
+      bic = info$bic
+    )
   }
 
   if (length(order_results) == 0) next
 
-  bic_vals   <- sapply(order_results, function(x) x$bic)
-  best_name  <- names(which.min(bic_vals))
-  best       <- order_results[[best_name]]
-  best_p     <- best$p; best_q <- best$q
+  bic_vals <- sapply(
+    order_results,
+    function(x) x$bic
+  )
+
+  best_name <- names(which.min(bic_vals))
+
+  best <- order_results[[best_name]]
+
+  best_p <- best$p
+  best_q <- best$q
   model_best <- best$model
 
   pred_vals <- numeric(n_test)
-  all_data  <- bind_rows(train_df, test_df) %>%
-    dplyr::select(all_of(c(avail_vars, EXOG_VARS[EXOG_VARS %in% names(sub)]))) %>%
-    mutate(across(everything(), ~ ifelse(is.na(.), mean(., na.rm = TRUE), .)))
+
+  all_data <- bind_rows(train_df, test_df) %>%
+    select(all_of(avail_vars)) %>%
+    mutate(across(
+      everything(),
+      ~ ifelse(is.na(.), mean(., na.rm = TRUE), .)
+    ))
 
   for (i in seq_len(n_test)) {
-    wf_train <- all_data[1:(nrow(train_df) + i - 1), avail_vars, drop = FALSE]
+
+    wf_train <- all_data[
+      1:(nrow(train_df)+i-1),
+      avail_vars,
+      drop = FALSE
+    ]
 
     wf_stat <- wf_train
+
     for (v in avail_vars)
       if (d_orders[v] > 0)
-        for (dd in seq_len(d_orders[v])) wf_stat[[v]] <- c(NA, diff(wf_stat[[v]]))
+        for (dd in seq_len(d_orders[v]))
+          wf_stat[[v]] <- c(NA, diff(wf_stat[[v]]))
+
     wf_stat <- drop_na(wf_stat)
 
     m <- tryCatch(
-      suppressMessages(VARMA(as.matrix(wf_stat), p = best_p, q = best_q, include.mean = TRUE)),
+      suppressMessages(
+        VARMA(
+          as.matrix(wf_stat),
+          p = best_p,
+          q = best_q,
+          include.mean = TRUE
+        )
+      ),
       error = function(e) NULL
     )
-    if (is.null(m)) { pred_vals[i] <- NA; next }
 
-    fc <- tryCatch(VARMApred(m, h = 1, orig = 0), error = function(e) NULL)
-    if (is.null(fc)) { pred_vals[i] <- NA; next }
+    if (is.null(m)) {
+      pred_vals[i] <- NA
+      next
+    }
+
+    fc <- tryCatch(
+      VARMApred(m, h = 1, orig = 0),
+      error = function(e) NULL
+    )
+
+    if (is.null(fc)) {
+      pred_vals[i] <- NA
+      next
+    }
 
     pred_diff <- as.numeric(fc$pred)[1]
 
     if (d_orders["target_price"] == 2) {
-      last_fd      <- diff(wf_train$target_price)
-      last_fd      <- last_fd[length(last_fd)]
-      pred_vals[i] <- wf_train$target_price[nrow(wf_train)] + last_fd + pred_diff
+
+      last_fd <- diff(wf_train$target_price)
+      last_fd <- last_fd[length(last_fd)]
+
+      pred_vals[i] <-
+        wf_train$target_price[nrow(wf_train)] +
+        last_fd +
+        pred_diff
+
     } else if (d_orders["target_price"] == 1) {
-      pred_vals[i] <- wf_train$target_price[nrow(wf_train)] + pred_diff
+
+      pred_vals[i] <-
+        wf_train$target_price[nrow(wf_train)] +
+        pred_diff
+
     } else {
+
       pred_vals[i] <- pred_diff
     }
   }
 
   actual <- test_df$target_price
-  valid  <- !is.na(pred_vals) & !is.na(actual) & real_idx
 
-  smape_val <- round(calc_smape(actual[valid], pred_vals[valid]), 4)
+  valid <- !is.na(pred_vals) &
+           !is.na(actual) &
+           real_idx
 
-  all_results[[comm]] <- tibble(commodity = comm, model = best_name, sMAPE = smape_val)
-  best_models[[comm]] <- model_best
-  all_preds[[comm]]   <- tibble(date = test_df$date, actual = actual, pred = pred_vals)
+  smape_val <- round(
+    calc_smape(actual[valid],
+               pred_vals[valid]),
+    4
+  )
+
+  all_results[[comm]] <- tibble(
+    commodity = comm,
+    model = best_name,
+    sMAPE = smape_val
+  )
+
+  all_models[[comm]] <- model_best
+
+  all_preds[[comm]] <- tibble(
+    date = test_df$date,
+    actual = actual,
+    pred = pred_vals
+  )
 }
 
 results_df <- bind_rows(all_results)
 ```
-```{r}
-cat("\n", strrep("=", 60), "\n")
-cat("  VARMA MODELS — sMAPE\n")
-cat(strrep("=", 60), "\n")
-print(results_df, n = Inf)
+
+### ALL VARMA MODELS — sMAPE
+
+```{r echo=FALSE}
+kable(results_df)
 ```
+
 ```{r}
-cat("\n  Residual diagnostics for best VARMA models:\n\n")
+best_df <- results_df %>%
+  group_by(commodity) %>%
+  slice_min(sMAPE,
+            n = 1,
+            with_ties = FALSE) %>%
+  ungroup()
+```
 
-for (comm in names(best_models)) {
-  model_best <- best_models[[comm]]
-  label      <- results_df %>% filter(commodity == comm) %>% pull(model)
+### BEST MODEL PER COMMODITY (by sMAPE)
 
-  avail_vars  <- VAR_VARS[VAR_VARS %in% names(df)]
-  avail_vars  <- c("target_price", avail_vars[avail_vars != "target_price"])
-  tgt_idx     <- which(avail_vars == "target_price")
+```{r echo=FALSE}
+kable(best_df)
+```
 
-  resid_mat <- tryCatch(model_best$residuals, error = function(e) NULL)
-  resid_target <- if (!is.null(resid_mat) && is.matrix(resid_mat) && ncol(resid_mat) >= tgt_idx) {
-    resid_mat[, tgt_idx]
-  } else {
-    rep(NA_real_, 10)
-  }
+### Residual diagnostics for best models
+
+```{r echo=FALSE}
+
+for (i in seq_len(nrow(best_df))) {
+
+  comm <- best_df$commodity[i]
+  best_model <- best_df$model[i]
+
+  model_best <- all_models[[comm]]
+
+  cat("\n####", comm, "—", best_model, "\n\n")
+
+  resid_mat <- tryCatch(
+    model_best$residuals,
+    error = function(e) NULL
+  )
+
+  if (is.null(resid_mat)) next
+
+  resid_target <- resid_mat[,1]
+
   resid_clean <- resid_target[!is.na(resid_target)]
 
-  cat(strrep("-", 50), "\n")
-  cat("  ", comm, "—", label, "\n")
-  cat(strrep("-", 50), "\n")
+  lb <- Box.test(
+    resid_clean,
+    lag = 10,
+    type = "Ljung-Box"
+  )
 
-  if (length(resid_clean) > 10) {
-    lb <- Box.test(resid_clean, lag = 10, type = "Ljung-Box")
-    cat(sprintf("  Ljung-Box(10) p-value: %.4f %s\n", lb$p.value,
-                ifelse(lb$p.value > ALPHA, "✓", "✗")))
+  cat(sprintf(
+    "  Ljung-Box(10) p-value: %.4f %s\n",
+    lb$p.value,
+    ifelse(lb$p.value > ALPHA,"✓","✗")
+  ))
 
-    if (length(resid_clean) <= 5000) {
-      nt <- shapiro.test(resid_clean)
-      cat(sprintf("  Shapiro-Wilk p-value:  %.4f %s\n", nt$p.value,
-                  ifelse(nt$p.value > ALPHA, "✓", "✗")))
-    }
-  } else {
-    cat("  Insufficient residuals for diagnostics\n")
+  if (length(resid_clean) <= 5000) {
+
+    nt <- shapiro.test(resid_clean)
+
+    cat(sprintf(
+      "  Shapiro-Wilk p-value: %.4f %s\n",
+      nt$p.value,
+      ifelse(nt$p.value > ALPHA,"✓","✗")
+    ))
   }
+
   cat("\n")
 }
 ```
+
 ```{r fig.width=12, fig.height=10}
+
 plots <- list()
 
-for (comm in names(all_preds)) {
-  label     <- results_df %>% filter(commodity == comm) %>% pull(model)
-  smape_val <- results_df %>% filter(commodity == comm) %>% pull(sMAPE)
+for (i in seq_len(nrow(best_df))) {
 
-  sub      <- df %>% filter(commodity == comm) %>% arrange(date)
-  train_df <- sub %>% filter(split == "train") %>% drop_na(target_price)
+  comm <- best_df$commodity[i]
+  best_model <- best_df$model[i]
+  best_smape <- best_df$sMAPE[i]
 
-  cutoff     <- max(train_df$date) - 365 * 2
-  train_plot <- train_df %>% filter(date >= cutoff)
-  test_plot  <- all_preds[[comm]]
+  sub <- df %>%
+    filter(commodity == comm) %>%
+    arrange(date)
+
+  train_df <- sub %>%
+    filter(split == "train") %>%
+    drop_na(target_price)
+
+  cutoff <- max(train_df$date) - 365*2
+
+  train_plot <- train_df %>%
+    filter(date >= cutoff)
+
+  test_plot <- all_preds[[comm]]
 
   p <- ggplot() +
-    geom_line(data = train_plot, aes(x = date, y = target_price),
-              color = "grey60", linewidth = 0.7) +
-    geom_line(data = test_plot, aes(x = date, y = actual, color = "Actual"),
-              linewidth = 0.9) +
-    geom_line(data = test_plot, aes(x = date, y = pred, color = "Forecast"),
-              linewidth = 0.9, linetype = "dashed") +
-    scale_color_manual(values = c("Actual" = "#2c3e50", "Forecast" = "#e74c3c"), name = NULL) +
-    labs(title = comm,
-         subtitle = sprintf("%s  |  sMAPE = %.2f", label, smape_val),
-         x = NULL, y = "Price") +
-    theme_minimal(base_size = 11) +
-    theme(plot.title = element_text(face = "bold", size = 12), legend.position = "bottom")
+    geom_line(
+      data = train_plot,
+      aes(x=date,y=target_price),
+      color="grey60",
+      linewidth=0.7
+    ) +
+    geom_line(
+      data = test_plot,
+      aes(x=date,y=actual,color="Actual"),
+      linewidth=0.9
+    ) +
+    geom_line(
+      data = test_plot,
+      aes(x=date,y=pred,color="Forecast"),
+      linewidth=0.9,
+      linetype="dashed"
+    ) +
+    scale_color_manual(
+      values=c(
+        "Actual"="#2c3e50",
+        "Forecast"="#e74c3c"
+      ),
+      name=NULL
+    ) +
+    labs(
+      title = comm,
+      subtitle = sprintf(
+        "%s  |  sMAPE = %.2f",
+        best_model,
+        best_smape
+      ),
+      x=NULL,
+      y="Price"
+    ) +
+    theme_minimal(base_size=11) +
+    theme(
+      plot.title = element_text(face="bold",size=12),
+      legend.position="bottom"
+    )
 
-  plots[[length(plots) + 1]] <- p
+  plots[[i]] <- p
 }
 
-if (length(plots) > 0) {
-  combined <- wrap_plots(plots, ncol = 2) +
-    plot_annotation(title = "VARMA — Forecast vs Actual",
-                    theme = theme(plot.title = element_text(face = "bold", size = 14)))
+if(length(plots)>0){
+
+  combined <- wrap_plots(
+    plots,
+    ncol=2
+  ) +
+  plot_annotation(
+    title="VARMA — Forecast vs Actual",
+    theme=theme(
+      plot.title=element_text(face="bold",size=14)
+    )
+  )
+
   print(combined)
 }
 ```
