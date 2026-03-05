@@ -1,0 +1,209 @@
+```{r}
+library(tidyverse)
+library(arrow)
+library(forecast)
+library(tseries)
+library(ggplot2)
+library(patchwork)
+library(knitr)
+```
+```{r}
+INPUT_FILE <- "../../data/processed/merged_features_weekly.parquet"
+FREQ <- 52
+ALPHA <- 0.05
+
+calc_smape <- function(actual, pred) {
+  mean(200 * abs(actual - pred) / (abs(actual) + abs(pred)), na.rm = TRUE)
+}
+```
+```{r}
+df <- arrow::read_parquet(INPUT_FILE) %>%
+  mutate(date = as.Date(date)) %>%
+  arrange(date)
+
+if (!"target_was_missing" %in% names(df)) df$target_was_missing <- 0L
+
+commodities <- unique(df$commodity)
+```
+```{r}
+all_results <- list()
+all_models <- list()
+all_preds <- list()
+
+for (comm in commodities) {
+  sub <- df %>%
+    filter(commodity == comm) %>%
+    arrange(date)
+
+  train_df <- sub %>%
+    filter(split == "train") %>%
+    drop_na(target_price)
+  test_df <- sub %>%
+    filter(split == "test") %>%
+    drop_na(target_price)
+
+  if (nrow(train_df) < 30 || nrow(test_df) == 0) next
+
+
+  n_test <- nrow(test_df)
+  train_ts <- ts(train_df$target_price, frequency = FREQ)
+
+  model_auto <- auto.arima(train_ts, seasonal = TRUE, trace = FALSE, ic = "aicc")
+  fc_auto <- forecast(model_auto, h = n_test)
+  pred_auto <- as.numeric(fc_auto$mean)
+
+  model_111 <- tryCatch(
+    Arima(train_ts, order = c(1, 1, 1), include.drift = FALSE),
+    error = function(e) NULL
+  )
+  pred_111 <- if (!is.null(model_111)) as.numeric(forecast(model_111, h = n_test)$mean) else rep(NA, n_test)
+
+  model_sarima <- tryCatch(
+    Arima(train_ts, order = c(1, 1, 1), seasonal = list(order = c(1, 1, 1), period = FREQ)),
+    error = function(e) NULL
+  )
+  pred_sarima <- if (!is.null(model_sarima)) as.numeric(forecast(model_sarima, h = n_test)$mean) else rep(NA, n_test)
+
+  pred_df <- tibble(
+    date = test_df$date, actual = test_df$target_price,
+    was_missing = test_df$target_was_missing,
+    auto_arima = pred_auto, arima_111 = pred_111, sarima = pred_sarima
+  )
+
+  real_idx <- pred_df$was_missing == 0
+
+  smape_auto <- round(calc_smape(pred_df$actual[real_idx], pred_df$auto_arima[real_idx]), 4)
+  smape_111 <- if (!is.null(model_111)) round(calc_smape(pred_df$actual[real_idx], pred_df$arima_111[real_idx]), 4) else NA
+  smape_sarima <- if (!is.null(model_sarima)) round(calc_smape(pred_df$actual[real_idx], pred_df$sarima[real_idx]), 4) else NA
+
+  models_fitted <- list(
+    "auto.arima" = model_auto,
+    "ARIMA(1,1,1)" = model_111,
+    "SARIMA(1,1,1)(1,1,1)[52]" = model_sarima
+  )
+
+  results <- tibble(
+    commodity = comm,
+    model = c("auto.arima", "ARIMA(1,1,1)", "SARIMA(1,1,1)(1,1,1)[52]"),
+    sMAPE = c(smape_auto, smape_111, smape_sarima)
+  ) %>% filter(!is.na(sMAPE))
+
+  all_results[[comm]] <- results
+  all_models[[comm]] <- models_fitted
+  all_preds[[comm]] <- pred_df
+}
+
+results_df <- bind_rows(all_results)
+```
+### ALL ARIMA MODELS — sMAPE
+
+```{r echo=FALSE}
+kable(results_df)
+```
+```{r}
+best_df <- results_df %>%
+  group_by(commodity) %>%
+  slice_min(sMAPE, n = 1, with_ties = FALSE) %>%
+  ungroup()
+### BEST MODEL PER COMMODITY (by sMAPE)
+
+```{r echo=FALSE}
+kable(best_df)
+```
+### Residual diagnostics for best models
+
+```{r echo=FALSE}
+
+for (i in seq_len(nrow(best_df))) {
+  comm <- best_df$commodity[i]
+  best_model <- best_df$model[i]
+  model_obj <- all_models[[comm]][[best_model]]
+
+  cat("\n####", comm, "—", best_model, "\n\n")
+
+  resid_clean <- as.numeric(residuals(model_obj))
+  resid_clean <- resid_clean[!is.na(resid_clean)]
+
+  lb <- Box.test(resid_clean, lag = 10, type = "Ljung-Box")
+  cat(sprintf(
+    "  Ljung-Box(10) p-value: %.4f %s\n", lb$p.value,
+    ifelse(lb$p.value > ALPHA, "✓", "✗")
+  ))
+
+  if (length(resid_clean) <= 5000) {
+    nt <- shapiro.test(resid_clean)
+    cat(sprintf(
+      "  Shapiro-Wilk p-value:  %.4f %s\n", nt$p.value,
+      ifelse(nt$p.value > ALPHA, "✓", "✗")
+    ))
+  }
+  cat("\n")
+}
+```
+```{r fig.width=12, fig.height=10}
+plots <- list()
+
+for (i in seq_len(nrow(best_df))) {
+  comm <- best_df$commodity[i]
+  best_model <- best_df$model[i]
+  best_smape <- best_df$sMAPE[i]
+
+  sub <- df %>%
+    filter(commodity == comm) %>%
+    arrange(date)
+  train_df <- sub %>%
+    filter(split == "train") %>%
+    drop_na(target_price)
+  test_df <- sub %>%
+    filter(split == "test") %>%
+    drop_na(target_price)
+
+  cutoff <- max(train_df$date) - 365 * 2
+  train_plot <- train_df %>% filter(date >= cutoff)
+
+  pred_df <- all_preds[[comm]]
+  pred_col <- switch(best_model,
+    "auto.arima" = "auto_arima",
+    "ARIMA(1,1,1)" = "arima_111",
+    "SARIMA(1,1,1)(1,1,1)[52]" = "sarima"
+  )
+
+  test_plot <- pred_df %>% select(date, actual, pred = all_of(pred_col))
+
+  p <- ggplot() +
+    geom_line(
+      data = train_plot, aes(x = date, y = target_price),
+      color = "grey60", linewidth = 0.7
+    ) +
+    geom_line(
+      data = test_plot, aes(x = date, y = actual, color = "Actual"),
+      linewidth = 0.9
+    ) +
+    geom_line(
+      data = test_plot, aes(x = date, y = pred, color = "Forecast"),
+      linewidth = 0.9, linetype = "dashed"
+    ) +
+    scale_color_manual(values = c("Actual" = "#2c3e50", "Forecast" = "#e74c3c"), name = NULL) +
+    labs(
+      title = comm,
+      subtitle = sprintf("%s  |  sMAPE = %.2f", best_model, best_smape),
+      x = NULL, y = "Price"
+    ) +
+    theme_minimal(base_size = 11) +
+    theme(
+      plot.title = element_text(face = "bold", size = 12),
+      legend.position = "bottom"
+    )
+
+  plots[[i]] <- p
+}
+
+if (length(plots) > 0) {
+  combined <- wrap_plots(plots, ncol = 2) +
+    plot_annotation(
+      title = "ARIMA — Best Model Forecast vs Actual",
+      theme = theme(plot.title = element_text(face = "bold", size = 14))
+    )
+  print(combined)
+}
+```

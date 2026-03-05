@@ -1,0 +1,117 @@
+```{r}
+library(tidyverse)
+library(arrow)
+library(tseries)
+library(lmtest)
+```
+```{r}
+INPUT_FILE <- "../../data/processed/merged_features_weekly.parquet"
+ALPHA      <- 0.05
+MAX_LAGS   <- c(1, 2, 4, 8)
+
+CANDIDATE_PREDICTORS <- c(
+  "api_energy_and_lubricants",
+  "api_fertilisers_and_soil_improvers",
+  "api_plant_protection_products",
+  "api_fresh_fruit",
+  "api_fresh_vegetables",
+  "fuel_petrol_price",
+  "fuel_diesel_price",
+  "sppi_road_freight"
+)
+
+make_stationary <- function(x) {
+  s <- x
+  for (d in 0:2) {
+    res <- tryCatch(adf.test(s[!is.na(s)]), error = function(e) list(p.value = 1))
+    if (res$p.value < ALPHA) return(list(series = s, d = d))
+    s <- c(NA, diff(s))
+  }
+  list(series = s, d = 2)
+}
+```
+```{r}
+df <- arrow::read_parquet(INPUT_FILE) %>%
+  mutate(date = as.Date(date)) %>%
+  arrange(date)
+
+commodities <- unique(df$commodity)
+```
+```{r}
+all_results <- list()
+
+for (comm in commodities) {
+  sub <- df %>% filter(commodity == comm) %>% arrange(date)
+
+  avail_preds <- CANDIDATE_PREDICTORS[
+    CANDIDATE_PREDICTORS %in% names(sub) &
+      sapply(CANDIDATE_PREDICTORS, function(v) sum(!is.na(sub[[v]])) > 30)
+  ]
+
+  tgt_st   <- make_stationary(sub$target_price)
+  target_s <- tgt_st$series
+
+  for (pred_name in avail_preds) {
+    pred_st <- make_stationary(sub[[pred_name]])
+    pred_s  <- pred_st$series
+
+    for (lag in MAX_LAGS) {
+      valid <- complete.cases(target_s, pred_s)
+      ts_y  <- target_s[valid]
+      ts_x  <- pred_s[valid]
+
+      if (length(ts_y) < lag + 10) next
+
+      res <- tryCatch(
+        grangertest(ts_y ~ ts_x, order = lag),
+        error = function(e) NULL
+      )
+      if (is.null(res)) next
+
+      all_results[[length(all_results) + 1]] <- tibble(
+        commodity   = comm,
+        predictor   = pred_name,
+        lag         = lag,
+        f_stat      = round(res$F[2], 4),
+        p_value     = round(res$`Pr(>F)`[2], 4),
+        significant = res$`Pr(>F)`[2] < ALPHA
+      )
+    }
+  }
+}
+
+results_df <- bind_rows(all_results)
+```
+```{r}
+best_df <- results_df %>%
+  group_by(commodity, predictor) %>%
+  slice_min(p_value, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  arrange(commodity, p_value)
+
+cat("\n", strrep("=", 60), "\n")
+cat("  GRANGER CAUSALITY — Best Lag per Predictor\n")
+cat(strrep("=", 60), "\n")
+print(best_df %>% select(commodity, predictor, lag, f_stat, p_value, significant), n = Inf)
+```
+```{r}
+sig_df <- best_df %>% filter(significant)
+
+cat("\n", strrep("=", 60), "\n")
+cat("  SIGNIFICANT GRANGER CAUSES (p <", ALPHA, ")\n")
+cat(strrep("=", 60), "\n")
+
+if (nrow(sig_df) > 0) {
+  for (comm in unique(sig_df$commodity)) {
+    cat("\n  ", comm, ":\n")
+    comm_sig <- sig_df %>% filter(commodity == comm)
+    for (j in seq_len(nrow(comm_sig))) {
+      cat(sprintf("    %s (lag %d, F=%.2f, p=%.4f)\n",
+                  comm_sig$predictor[j], comm_sig$lag[j],
+                  comm_sig$f_stat[j], comm_sig$p_value[j]))
+    }
+  }
+} else {
+  cat("  No significant Granger-causal relationships found.\n")
+}
+```

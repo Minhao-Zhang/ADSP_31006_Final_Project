@@ -1,0 +1,216 @@
+```{r}
+library(tidyverse)
+library(arrow)
+library(forecast)
+library(tseries)
+library(ggplot2)
+library(patchwork)
+```
+```{r}
+INPUT_FILE <- "../../data/processed/merged_features_weekly.parquet"
+FREQ       <- 52
+ALPHA      <- 0.05
+
+XREG_VARS <- c(
+  "api_energy_and_lubricants",
+  "api_fertilisers_and_soil_improvers",
+  "api_plant_protection_products",
+  "api_fresh_fruit",
+  "api_fresh_vegetables",
+  "fuel_petrol_price",
+  "fuel_diesel_price",
+  "sppi_road_freight"
+)
+
+DUMMY_VARS <- c("shock_2021q4_2023q1", "post_shock")
+
+calc_smape <- function(actual, pred) {
+  mean(200 * abs(actual - pred) / (abs(actual) + abs(pred)), na.rm = TRUE)
+}
+
+build_xreg <- function(data, vars) {
+  avail <- vars[vars %in% names(data)]
+  if (length(avail) == 0) return(NULL)
+  mat <- data %>% select(all_of(avail)) %>% as.matrix()
+  for (j in seq_len(ncol(mat))) {
+    col_mean <- mean(mat[, j], na.rm = TRUE)
+    mat[is.na(mat[, j]), j] <- col_mean
+  }
+  mat
+}
+```
+```{r}
+df <- arrow::read_parquet(INPUT_FILE) %>%
+  mutate(date = as.Date(date)) %>%
+  arrange(date)
+
+if (!"target_was_missing" %in% names(df)) df$target_was_missing <- 0L
+
+commodities <- unique(df$commodity)
+```
+```{r}
+all_results   <- list()
+best_models   <- list()
+all_preds     <- list()
+
+for (comm in commodities) {
+  sub <- df %>% filter(commodity == comm) %>% arrange(date)
+
+  train_df <- sub %>% filter(split == "train")
+  test_df  <- sub %>% filter(split == "test")
+
+  if (nrow(train_df) < 30 || nrow(test_df) == 0) next
+
+  n_test   <- nrow(test_df)
+  train_ts <- ts(train_df$target_price, frequency = FREQ)
+  real_idx <- test_df$target_was_missing == 0
+
+  base_model <- auto.arima(train_ts, seasonal = TRUE, trace = FALSE, ic = "aicc")
+  arma <- base_model$arma
+  pdq  <- c(arma[1], arma[6], arma[2])
+  PDQ  <- c(arma[3], arma[7], arma[4])
+
+  avail_xreg    <- XREG_VARS[XREG_VARS %in% names(sub) &
+                               sapply(XREG_VARS, function(v) sum(!is.na(train_df[[v]])) > 10)]
+  avail_dummies <- DUMMY_VARS[DUMMY_VARS %in% names(sub)]
+
+  comm_results <- list()
+  comm_models  <- list()
+  pred_full    <- rep(NA, n_test)
+  pred_dum     <- rep(NA, n_test)
+
+  all_reg_vars    <- c(avail_xreg, avail_dummies)
+  xreg_train_full <- build_xreg(train_df, all_reg_vars)
+  xreg_test_full  <- build_xreg(test_df,  all_reg_vars)
+
+  model_full <- tryCatch(
+    Arima(train_ts, order = pdq,
+          seasonal = list(order = PDQ, period = FREQ),
+          xreg = xreg_train_full, include.drift = FALSE),
+    error = function(e) NULL
+  )
+
+  if (!is.null(model_full)) {
+    fc_full   <- forecast(model_full, xreg = xreg_test_full, h = n_test)
+    pred_full <- as.numeric(fc_full$mean)
+    smape_full <- round(calc_smape(test_df$target_price[real_idx], pred_full[real_idx]), 4)
+    comm_results[["full"]] <- tibble(commodity = comm, model = "Full xreg", sMAPE = smape_full)
+    comm_models[["Full xreg"]] <- model_full
+  }
+
+  if (length(avail_dummies) > 0) {
+    xreg_train_dum <- build_xreg(train_df, avail_dummies)
+    xreg_test_dum  <- build_xreg(test_df,  avail_dummies)
+
+    model_dum <- tryCatch(
+      Arima(train_ts, order = pdq,
+            seasonal = list(order = PDQ, period = FREQ),
+            xreg = xreg_train_dum, include.drift = FALSE),
+      error = function(e) NULL
+    )
+
+    if (!is.null(model_dum)) {
+      fc_dum   <- forecast(model_dum, xreg = xreg_test_dum, h = n_test)
+      pred_dum <- as.numeric(fc_dum$mean)
+      smape_dum <- round(calc_smape(test_df$target_price[real_idx], pred_dum[real_idx]), 4)
+      comm_results[["dummies"]] <- tibble(commodity = comm, model = "Dummies only", sMAPE = smape_dum)
+      comm_models[["Dummies only"]] <- model_dum
+    }
+  }
+
+  results <- bind_rows(comm_results)
+  if (nrow(results) > 0) {
+    all_results[[comm]] <- results
+
+    best_row   <- results %>% slice_min(sMAPE, n = 1, with_ties = FALSE)
+    best_label <- best_row$model
+    best_models[[comm]] <- comm_models[[best_label]]
+
+    best_pred <- if (best_label == "Full xreg") pred_full else pred_dum
+    all_preds[[comm]] <- tibble(date = test_df$date, actual = test_df$target_price, pred = best_pred)
+  }
+}
+
+results_df <- bind_rows(all_results)
+```
+```{r}
+cat("\n", strrep("=", 60), "\n")
+cat("  REGRESSION WITH ARIMA ERRORS — sMAPE\n")
+cat(strrep("=", 60), "\n")
+print(results_df, n = Inf)
+```
+```{r}
+best_df <- results_df %>%
+  group_by(commodity) %>%
+  slice_min(sMAPE, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+cat("\n", strrep("=", 60), "\n")
+cat("  BEST MODEL PER COMMODITY (by sMAPE)\n")
+cat(strrep("=", 60), "\n")
+print(best_df, n = Inf)
+```
+```{r}
+cat("\n  Residual diagnostics for best models:\n\n")
+
+for (comm in names(best_models)) {
+  model_obj <- best_models[[comm]]
+  label     <- best_df %>% filter(commodity == comm) %>% pull(model)
+
+  resid_clean <- as.numeric(residuals(model_obj))
+  resid_clean <- resid_clean[!is.na(resid_clean)]
+
+  cat(strrep("-", 50), "\n")
+  cat("  ", comm, "—", label, "\n")
+  cat(strrep("-", 50), "\n")
+
+  lb <- Box.test(resid_clean, lag = 10, type = "Ljung-Box")
+  cat(sprintf("  Ljung-Box(10) p-value: %.4f %s\n", lb$p.value,
+              ifelse(lb$p.value > ALPHA, "✓", "✗")))
+
+  if (length(resid_clean) <= 5000) {
+    nt <- shapiro.test(resid_clean)
+    cat(sprintf("  Shapiro-Wilk p-value:  %.4f %s\n", nt$p.value,
+                ifelse(nt$p.value > ALPHA, "✓", "✗")))
+  }
+  cat("\n")
+}
+```
+```{r fig.width=12, fig.height=10}
+plots <- list()
+
+for (comm in names(all_preds)) {
+  label     <- best_df %>% filter(commodity == comm) %>% pull(model)
+  smape_val <- best_df %>% filter(commodity == comm) %>% pull(sMAPE)
+
+  sub      <- df %>% filter(commodity == comm) %>% arrange(date)
+  train_df <- sub %>% filter(split == "train") %>% drop_na(target_price)
+
+  cutoff     <- max(train_df$date) - 365 * 2
+  train_plot <- train_df %>% filter(date >= cutoff)
+  test_plot  <- all_preds[[comm]]
+
+  p <- ggplot() +
+    geom_line(data = train_plot, aes(x = date, y = target_price),
+              color = "grey60", linewidth = 0.7) +
+    geom_line(data = test_plot, aes(x = date, y = actual, color = "Actual"),
+              linewidth = 0.9) +
+    geom_line(data = test_plot, aes(x = date, y = pred, color = "Forecast"),
+              linewidth = 0.9, linetype = "dashed") +
+    scale_color_manual(values = c("Actual" = "#2c3e50", "Forecast" = "#e74c3c"), name = NULL) +
+    labs(title = comm,
+         subtitle = sprintf("%s  |  sMAPE = %.2f", label, smape_val),
+         x = NULL, y = "Price") +
+    theme_minimal(base_size = 11) +
+    theme(plot.title = element_text(face = "bold", size = 12), legend.position = "bottom")
+
+  plots[[length(plots) + 1]] <- p
+}
+
+if (length(plots) > 0) {
+  combined <- wrap_plots(plots, ncol = 2) +
+    plot_annotation(title = "Regression with ARIMA Errors — Forecast vs Actual",
+                    theme = theme(plot.title = element_text(face = "bold", size = 14)))
+  print(combined)
+}
+```
