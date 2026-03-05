@@ -163,92 +163,45 @@ for (comm in commodities) {
 
   if (is.null(model_var)) next
 
+  fc <- tryCatch(
+    predict(
+      model_var,
+      n.ahead = n_test,
+      dumvar = if (length(avail_exog) > 0)
+        as.matrix(test_df %>% select(all_of(avail_exog)))
+      else NULL
+    ),
+    error = function(e) NULL
+  )
+
+  if (is.null(fc)) next
+
+  pred_diff <- fc$fcst$target_price[, "fcst"]
   pred_vals <- numeric(n_test)
 
-  all_data <- bind_rows(train_df, test_df) %>%
-    select(all_of(c(avail_vars, avail_exog))) %>%
-    mutate(across(everything(),
-           ~ ifelse(is.na(.), mean(., na.rm = TRUE), .)))
+  last_val <- tail(train_df$target_price, 1)
 
-  for (i in seq_len(n_test)) {
+  if (d_orders["target_price"] == 2) {
 
-    wf_train <- all_data[
-      1:(nrow(train_df) + i - 1),
-      avail_vars,
-      drop = FALSE
-    ]
+    last_fd <- diff(train_df$target_price)
+    last_fd <- last_fd[length(last_fd)]
 
-    wf_stat <- wf_train
-
-    for (v in avail_vars)
-      if (d_orders[v] > 0)
-        for (dd in seq_len(d_orders[v]))
-          wf_stat[[v]] <- c(NA, diff(wf_stat[[v]]))
-
-    wf_stat <- drop_na(wf_stat)
-
-    wf_exog <- if (length(avail_exog) > 0)
-      as.matrix(
-        all_data[
-          seq_len(nrow(train_df) + i - 1),
-          avail_exog
-        ] %>% tail(nrow(wf_stat))
-      )
-    else NULL
-
-    wf_exog_fc <- if (length(avail_exog) > 0)
-      as.matrix(
-        all_data[nrow(train_df) + i, avail_exog]
-      )
-    else NULL
-
-    m <- tryCatch(
-      VAR(wf_stat,
-          p = chosen_lag,
-          type = "const",
-          exogen = wf_exog),
-      error = function(e) NULL
-    )
-
-    if (is.null(m)) {
-      pred_vals[i] <- NA
-      next
+    for (i in seq_len(n_test)) {
+      last_fd <- last_fd + pred_diff[i]
+      last_val <- last_val + last_fd
+      pred_vals[i] <- last_val
     }
 
-    fc <- tryCatch(
-      predict(m,
-              n.ahead = 1,
-              dumvar = wf_exog_fc),
-      error = function(e) NULL
-    )
+  } else if (d_orders["target_price"] == 1) {
 
-    if (is.null(fc)) {
-      pred_vals[i] <- NA
-      next
+    for (i in seq_len(n_test)) {
+      last_val <- last_val + pred_diff[i]
+      pred_vals[i] <- last_val
     }
 
-    pred_diff <- fc$fcst$target_price[1, "fcst"]
+  } else {
 
-    if (d_orders["target_price"] == 2) {
-
-      last_fd <- diff(wf_train$target_price)
-      last_fd <- last_fd[length(last_fd)]
-
-      pred_vals[i] <-
-        wf_train$target_price[nrow(wf_train)] +
-        last_fd +
-        pred_diff
-
-    } else if (d_orders["target_price"] >= 1) {
-
-      pred_vals[i] <-
-        wf_train$target_price[nrow(wf_train)] +
-        pred_diff
-
-    } else {
-
-      pred_vals[i] <- pred_diff
-    }
+    pred_vals <- pred_diff
   }
 
   actual <- test_df$target_price
