@@ -3,3 +3,6 @@ numpy
 scikit-learn
 statsmodels
 jupyter
+pyarrow
+matplotlib
+seaborn
