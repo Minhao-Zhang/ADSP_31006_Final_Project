@@ -30,7 +30,9 @@ VAR_VARS <- c(
 
 EXOG_VARS <- c(
   "shock_2021q4_2023q1",
-  "post_shock"
+  "post_shock",
+  "week_sin",
+  "week_cos"
 )
 
 calc_smape <- function(actual, pred) {
@@ -41,7 +43,7 @@ make_stationary <- function(x, name, alpha = 0.05) {
 
   s <- x
 
-  for (d in 0:2) {
+  for (d in 0:1) {
 
     pval <- tryCatch(
       adf.test(s[!is.na(s)])$p.value,
@@ -54,7 +56,7 @@ make_stationary <- function(x, name, alpha = 0.05) {
     s <- c(NA, diff(s))
   }
 
-  list(series = s, d = 2)
+  list(series = s, d = 1)
 }
 ```
 
