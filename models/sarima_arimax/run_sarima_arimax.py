@@ -10,8 +10,11 @@ import numpy as np
 import pandas as pd
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 
-INPUT_CSV = Path("data/processed/merged_features_weekly.csv")
-OUTPUT_ROOT = Path("models/sarima_arimax/outputs")
+_HERE = Path(__file__).resolve().parent          # models/sarima_arimax/
+_ROOT = _HERE.parent.parent                      # project root
+
+INPUT_PARQUET = _ROOT / "data" / "processed" / "merged_features_weekly.parquet"
+OUTPUT_ROOT = _HERE / "outputs"
 
 SARIMA_DIR = OUTPUT_ROOT / "sarima"
 ARIMAX_DIR = OUTPUT_ROOT / "arimax"
@@ -161,10 +164,10 @@ def write_forecast_file(
 
 def main() -> None:
     ensure_dirs()
-    if not INPUT_CSV.exists():
-        raise FileNotFoundError(f"Missing input CSV: {INPUT_CSV}")
+    if not INPUT_PARQUET.exists():
+        raise FileNotFoundError(f"Missing input parquet: {INPUT_PARQUET}")
 
-    df = pd.read_csv(INPUT_CSV, parse_dates=["date"])
+    df = pd.read_parquet(INPUT_PARQUET)
     req = {"date", "commodity", "target_price"}
     missing = req - set(df.columns)
     if missing:
