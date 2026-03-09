@@ -6,6 +6,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from statsmodels.tsa.statespace.sarimax import SARIMAX
@@ -47,6 +50,7 @@ class Metrics:
 def ensure_dirs() -> None:
     for model_dir in (SARIMA_DIR, ARIMAX_DIR):
         (model_dir / "forecasts").mkdir(parents=True, exist_ok=True)
+        (model_dir / "plots").mkdir(parents=True, exist_ok=True)
 
 
 def sanitize(name: str) -> str:
@@ -162,6 +166,48 @@ def write_forecast_file(
     out.to_csv(out_path, index=False)
 
 
+def plot_forecast(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    pred: np.ndarray,
+    commodity: str,
+    smape_val: float,
+    model_label: str,
+    out_path: Path,
+) -> None:
+    """Forecast vs actual plot with sMAPE annotated in the title."""
+    # Show only the last 2 years of training for readability
+    train_tail = train_df[
+        train_df["date"] >= train_df["date"].max() - pd.Timedelta(days=730)
+    ]
+
+    fig, ax = plt.subplots(figsize=(13, 5))
+    ax.plot(
+        train_tail["date"], train_tail["target_price"],
+        color="#95a5a6", linewidth=0.8, label="Train (last 2 yr)",
+    )
+    ax.plot(
+        test_df["date"], test_df["target_price"],
+        color="#2c3e50", linewidth=1.4, label="Actual",
+    )
+    ax.plot(
+        test_df["date"], pred,
+        color="#e74c3c", linewidth=1.4, linestyle="--",
+        label=f"Forecast  (sMAPE = {smape_val:.2f}%)",
+    )
+    ax.axvline(test_df["date"].iloc[0], color="grey", linestyle=":", linewidth=0.9)
+    ax.set_title(
+        f"{model_label} — {commodity}\nsMAPE = {smape_val:.2f}%",
+        fontsize=12, fontweight="bold",
+    )
+    ax.set_ylabel("Price (£/unit)")
+    ax.legend(loc="upper left", fontsize=9)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
 def main() -> None:
     ensure_dirs()
     if not INPUT_PARQUET.exists():
@@ -219,6 +265,12 @@ def main() -> None:
                 sarima_pred,
                 "SARIMA(1,1,1)(1,1,1,52)",
             )
+            plot_forecast(
+                train_df, test_df, sarima_pred,
+                str(commodity), sarima_m.smape,
+                "SARIMA(1,1,1)(1,1,1,52)",
+                SARIMA_DIR / "plots" / f"{safe}.png",
+            )
             sarima_rows.append(
                 {
                     "commodity": commodity,
@@ -254,6 +306,12 @@ def main() -> None:
                     arimax_pred,
                     "ARIMAX(1,1,1)+xreg",
                 )
+                plot_forecast(
+                    train_df, test_df, arimax_pred,
+                    str(commodity), arimax_m.smape,
+                    "ARIMAX(1,1,1)+xreg",
+                    ARIMAX_DIR / "plots" / f"{safe}.png",
+                )
                 arimax_rows.append(
                     {
                         "commodity": commodity,
@@ -281,7 +339,9 @@ def main() -> None:
     pd.DataFrame(status_rows).to_csv(OUTPUT_ROOT / "run_status.csv", index=False)
 
     print(f"Wrote: {SARIMA_DIR / 'metrics.csv'}")
+    print(f"Wrote: {SARIMA_DIR / 'plots'}/<commodity>.png")
     print(f"Wrote: {ARIMAX_DIR / 'metrics.csv'}")
+    print(f"Wrote: {ARIMAX_DIR / 'plots'}/<commodity>.png")
     print(f"Wrote: {OUTPUT_ROOT / 'run_status.csv'}")
 
 
