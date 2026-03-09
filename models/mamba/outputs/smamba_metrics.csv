@@ -1,0 +1,5 @@
+model,RMSE,MAE,MASE,sMAPE,MAPE
+Bulb Onions (Yellow) — S-Mamba,0.0482,0.0367,1.0283,6.7227,6.782
+Cabbage — S-Mamba,0.0907,0.0767,3.7327,10.7041,11.5813
+Carrots — S-Mamba,0.0349,0.025,1.3961,4.7679,4.8599
+Lettuce — S-Mamba,0.0299,0.023,1.0475,3.3154,3.2786
