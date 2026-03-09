@@ -1,0 +1,127 @@
+---
+title: "EDA and Stationarity Analysis for 4 Selected Commodities"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(tidyverse)
+library(arrow)
+library(ggplot2)
+library(tseries)
+library(forecast)
+library(patchwork)
+```
+
+## Data Loading
+
+We load the `merged_features_weekly.parquet` dataset which contains the 4 selected commodities.
+
+```{r load_data}
+INPUT_FILE <- "../data/processed/merged_features_weekly.parquet"
+df <- arrow::read_parquet(INPUT_FILE) %>%
+  mutate(date = as.Date(date)) %>%
+  arrange(date)
+
+commodities <- unique(df$commodity)
+print(commodities)
+```
+
+## Raw Time Series Plots
+
+To understand the overall trend and volatility across the different commodities, we visualize their price history.
+
+```{r ts_plots, fig.width=10, fig.height=8}
+p_ts <- df %>%
+  ggplot(aes(x = date, y = target_price, color = split)) +
+  geom_line() +
+  facet_wrap(~commodity, scales = "free_y", ncol = 2) +
+  theme_minimal() +
+  labs(title = "Weekly Prices by Commodity", x = "Date", y = "Price")
+print(p_ts)
+```
+
+## Stationarity Tests (ADF and KPSS)
+
+We perform the Augmented Dickey-Fuller (ADF) test (null hypothesis: non-stationary) and the KPSS test (null hypothesis: stationary) on the training set for each commodity to determine if differencing is necessary for modeling. We do this for both the raw series and their first differences.
+
+```{r stationarity}
+FREQ <- 52
+
+test_results_list <- list()
+
+for (comm in commodities) {
+  sub_train <- df %>%
+    filter(commodity == comm, split == "train") %>%
+    drop_na(target_price) %>%
+    arrange(date)
+  
+  ts_data <- ts(sub_train$target_price, frequency = FREQ)
+  diff_ts_data <- diff(ts_data)
+  
+  adf_raw <- adf.test(ts_data, alternative = "stationary")
+  adf_diff <- adf.test(diff_ts_data, alternative = "stationary")
+  
+  kpss_raw <- kpss.test(ts_data)
+  kpss_diff <- kpss.test(diff_ts_data)
+  
+  test_results_list[[comm]] <- tibble(
+    commodity = comm,
+    series = c("Raw", "1st Diff"),
+    ADF_statistic = c(adf_raw$statistic, adf_diff$statistic),
+    ADF_p_value = c(adf_raw$p.value, adf_diff$p.value),
+    KPSS_statistic = c(kpss_raw$statistic, kpss_diff$statistic),
+    KPSS_p_value = c(kpss_raw$p.value, kpss_diff$p.value)
+  )
+}
+
+test_results <- bind_rows(test_results_list)
+knitr::kable(test_results, digits = 4)
+```
+
+## ACF and PACF Analysis
+
+ACF and PACF plots are generated to help identify potential AR and MA terms for ARIMA modeling. 
+
+```{r acf_pacf, fig.width=12, fig.height=12}
+for (comm in commodities) {
+  sub_train <- df %>%
+    filter(commodity == comm, split == "train") %>%
+    drop_na(target_price) %>%
+    arrange(date)
+    
+  ts_data <- ts(sub_train$target_price, frequency = FREQ)
+  diff_ts_data <- diff(ts_data)
+  
+  cat("\n### Commodity:", comm, "\n\n")
+  
+  p1 <- ggAcf(ts_data, main = paste("ACF: Raw -", comm))
+  p2 <- ggPacf(ts_data, main = paste("PACF: Raw -", comm))
+  p3 <- ggAcf(diff_ts_data, main = paste("ACF: 1st Diff -", comm))
+  p4 <- ggPacf(diff_ts_data, main = paste("PACF: 1st Diff -", comm))
+  
+  print((p1 | p2) / (p3 | p4))
+  cat("\n\n")
+}
+```
+
+## STL Decomposition
+
+We apply STL decomposition to separate the time series into trend, seasonal, and remainder components to better understand underlying patterns.
+
+```{r stl, fig.width=10, fig.height=8}
+for (comm in commodities) {
+  sub_train <- df %>%
+    filter(commodity == comm, split == "train") %>%
+    drop_na(target_price) %>%
+    arrange(date)
+    
+  ts_data <- ts(sub_train$target_price, frequency = FREQ)
+  
+  fit <- stl(ts_data, s.window = "periodic", robust = TRUE)
+  
+  cat("\n### Decomposition:", comm, "\n\n")
+  plot(fit, main = paste("STL Decomposition -", comm))
+  cat("\n\n")
+}
+```
